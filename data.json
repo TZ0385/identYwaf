@@ -1,6 +1,12 @@
 {
-    "__copyright__": "Copyright (c) 2019-2021 Miroslav Stampar (@stamparm), MIT. See the file 'LICENSE' for copying permission",
+    "__copyright__": "Copyright (c) 2019-2026 Miroslav Stampar (@stamparm), MIT. See the file 'LICENSE' for copying permission",
     "__notice__": "The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software",
+    "schema_version": 1,
+    "signature_version": 1,
+    "payloads_hash": "sha256:fb01e93298bc849787e539b29f8debc0593b0174a3030f48cf93ae56a7ad64ba",
+    "signature_collisions": {
+        "5c5d:RVZXum60OEhCWapAYKYPkoJyWOpohM4JiUcMr2RWg1uQJbX2uhdOnthtOj+hX7AB16FcPhJPdLsXo2tLaK99n+i6c4RmkgI2FZjxtDtAeq6c3qA4chW1XaTC": ["cdnns", "janusec"]
+    },
 
     "payloads": [
         "HTML::<img>",
@@ -274,7 +280,6 @@
                 "ade8:RVZXum60OEhCWapAYKYPkoJzWOpohc4IiUYMr2RXg1uQJbX3uhdOn9htOj+hX7AB16FcPxJPdLsXo2tKaK99n+i7c4VmkwI3FZjxtDtAeq+c36A5chW1XaTD",
                 "f063:RVZXum60OEhCWapAYKYPkoJzWOpohM4IiUYMr2RXg1uQJLX3uhdOnthtOj+hX7AB16FcPxJPdLsXo2tKaK99n+i7c4VmkwI3FZjxtDtAeq+c36A5chW1XaTD",
                 "985c:RVZXum60OEhCWapAYKYPkoJzWOpohc4IiUYMr2RXg1uQJLX3uhdOnthtOj+hX7AB16FcPxJPdLsXo2tKaK99n+i7c4VmkwI3FZjxtDtAeq+c3qA5chW1XaTD",
-                "f063:RVZXum60OEhCWapAYKYPkoJzWOpohM4IiUYMr2RXg1uQJLX3uhdOnthtOj+hX7AB16FcPxJPdLsXo2tKaK99n+i7c4VmkwI3FZjxtDtAeq+c36A5chW1XaTD",
                 "1971:RVZXum60OEhCWapAYKYPkoJzWOpohM4IiUYMr2RXg1uQJLX3uhdOnthtOj+hX7AB16FcPxJPdLsXo2tKaK99n+i7c4RmkgI2FZjxtDtAeq+c36A5chW1XaTD"
             ]
         },
@@ -476,7 +481,6 @@
                 "f53e:RVZXum60OEhCWapAYKYPkoJyWOpohM4JiUcMr2RXg1uQJLX2uhdOnthtOj+hXrAB16FcPxJPdLsXomtKaK59n+i7c4RmkgI2FZjxtDtAeq6c36A4chW1XaTD",
                 "e15c:RVZXum60OEhCWapAYKYPkoJyWOpohM4JiUcMr2RXg1uQJLX2uhZOnthtOj+hX7AB16FcPhJPdLoXomtKaK59n+i6c4RmkgI2FZjxtDtAeq6c36A4chW1XaTD",
                 "ded8:RVZXum60OEhCWapAYKYPkoJyWOpohM4JiUcMr2RXg1uQJLX2uhZOnthtOj+hXrAB16FcPhJPdLsXomtKaK59n+i6c4RmkgI2FZjxtDtAeq6c36A4chW1XaTD",
-                "6e99:RVZXum60OEhCWapAYKYPkoJyWOpohM4JiUcMr2RXg1uQJLX2uhdOnthtOj+hXrAB16FcPhJPdLsXomtKaK59n+i6c4RmkgI2FZjxtDtAeq6c36A4chW1XaTD",
                 "7986:RVZXum60OEhCWapAYKYPkoJyWOpohM4JiUcMr2RXg1uQJLX2uhdOnthtOj+hXrAB16FcPhJOdLsXomtKaK59n+i6c4RmkgI2FZjxtDtAeq6c36A4chW1XaTD",
                 "02b2:RVZXum60OEhCWapAYKYPkoJyWOpohM4JiUcMr2RXg1uQJLX2uhdOnthtOj+hX7AB16FcPxJPdLsXomtKaK59n+i7c4RmkgI2FZjxtDtAeq+c36A4chW1XaTD",
                 "4602:RVZXum60OEhCWapAYKYPkoJyWOpohM4JiUcMr2RXg1uQJLX2uhdOnthtOj+hX7AB16FcPhJOdLoXomtKaK59n+i6c4RmkgI2FZjxtDtAeq6c36A4chW1XaTD",

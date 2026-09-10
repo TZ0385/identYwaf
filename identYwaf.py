@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-Copyright (c) 2019-2022 Miroslav Stampar (@stamparm), MIT
+Copyright (c) 2019-2026 Miroslav Stampar (@stamparm), MIT
 See the file 'LICENSE' for copying permission
 
 The above copyright notice and this permission notice shall be included in
@@ -11,8 +11,11 @@ all copies or substantial portions of the Software.
 from __future__ import print_function
 
 import base64
+import binascii
 import codecs
 import difflib
+import hashlib
+import io
 import json
 import locale
 import optparse
@@ -32,6 +35,7 @@ PY3 = sys.version_info >= (3, 0)
 if PY3:
     import http.cookiejar
     import http.client as httplib
+    import urllib.parse
     import urllib.request
 
     build_opener = urllib.request.build_opener
@@ -42,6 +46,7 @@ if PY3:
     ProxyHandler = urllib.request.ProxyHandler
     Request = urllib.request.Request
     HTTPCookieProcessor = urllib.request.HTTPCookieProcessor
+    urlsplit = urllib.parse.urlsplit
 
     xrange = range
 else:
@@ -49,6 +54,7 @@ else:
     import httplib
     import urllib
     import urllib2
+    import urlparse
 
     build_opener = urllib2.build_opener
     install_opener = urllib2.install_opener
@@ -58,9 +64,10 @@ else:
     ProxyHandler = urllib2.ProxyHandler
     Request = urllib2.Request
     HTTPCookieProcessor = urllib2.HTTPCookieProcessor
+    urlsplit = urlparse.urlsplit
 
 NAME = "identYwaf"
-VERSION = "1.0.135"
+VERSION = "1.0.136"
 BANNER = r"""
                                    ` __ __ `
  ____  ___      ___  ____   ______ `|  T  T` __    __   ____  _____ 
@@ -77,10 +84,13 @@ GENERIC_PROTECTION_KEYWORDS = ("rejected", "forbidden", "suspicious", "malicious
 GENERIC_PROTECTION_REGEX = r"(?i)\b(%s)\b"
 GENERIC_ERROR_MESSAGE_REGEX = r"\b[A-Z][\w, '-]*(protected by|security|unauthorized|detected|attack|error|rejected|allowed|suspicious|automated|blocked|invalid|denied|permission)[\w, '!-]*"
 WAF_RECOGNITION_REGEX = None
+WAF_PATTERNS = {}
 HEURISTIC_PAYLOAD = "1 AND 1=1 UNION ALL SELECT 1,NULL,'<script>alert(\"XSS\")</script>',table_name FROM information_schema.tables WHERE 2>1--/**/; EXEC xp_cmdshell('cat ../../../etc/passwd')#"  # Reference: https://github.com/sqlmapproject/sqlmap/blob/master/lib/core/settings.py
 PAYLOADS = []
 SIGNATURES = {}
 DATA_JSON = {}
+DATA_VALIDATION_WARNINGS = []
+DATA_VALIDATION_STATS = {}
 DATA_JSON_FILE = os.path.join(os.path.dirname(__file__), "data.json")
 MAX_HELP_OPTION_LENGTH = 18
 IS_TTY = sys.stdout.isatty()
@@ -124,6 +134,7 @@ servers = set()
 codes = set()
 proxies = list()
 proxies_index = 0
+cookie_jar = None
 
 _exit = sys.exit
 
@@ -132,32 +143,54 @@ def exit(message=None):
         print("%s%s" % (message, ' ' * 20))
     _exit(1)
 
+def _install_http_opener(proxy=None):
+    global cookie_jar
+
+    if cookie_jar is None:
+        cookie_jar = CookieJar()
+
+    handlers = [HTTPCookieProcessor(cookie_jar)]
+    if proxy:
+        handlers.append(ProxyHandler({"http": proxy, "https": proxy}))
+    install_opener(build_opener(*handlers))
+
 def retrieve(url, data=None):
     global proxies_index
 
     retval = {}
 
     if proxies:
-        while True:
+        proxy_available = False
+        for _ in xrange(len(proxies)):
+            proxy = proxies[proxies_index]
+            proxies_index = (proxies_index + 1) % len(proxies)
+            _install_http_opener(proxy)
+
             try:
-                opener = build_opener(ProxyHandler({"http": proxies[proxies_index], "https": proxies[proxies_index]}))
-                install_opener(opener)
-                proxies_index = (proxies_index + 1) % len(proxies)
-                urlopen(PROXY_TESTING_PAGE).read()
+                response = urlopen(PROXY_TESTING_PAGE, timeout=options.timeout)
+                response.read()
+                response.close()
             except KeyboardInterrupt:
                 raise
-            except:
+            except Exception:
                 pass
             else:
+                proxy_available = True
                 break
 
+        if not proxy_available:
+            exit(colorize("[x] none of the configured proxies is responding"))
+
     try:
+        if data is not None and not isinstance(data, bytes):
+            data = data.encode("utf8")
         req = Request("".join(url[_].replace(' ', "%20") if _ > url.find('?') else url[_] for _ in xrange(len(url))), data, HEADERS)
         resp = urlopen(req, timeout=options.timeout)
         retval[URL] = resp.url
         retval[HTML] = resp.read()
         retval[HTTPCODE] = resp.code
         retval[RAW] = "%s %d %s\n%s\n%s" % (httplib.HTTPConnection._http_vsn_str, retval[HTTPCODE], resp.msg, str(resp.headers), retval[HTML])
+        resp.close()
     except Exception as ex:
         retval[URL] = getattr(ex, "url", url)
         retval[HTTPCODE] = getattr(ex, "code", None)
@@ -189,6 +222,145 @@ def calc_hash(value, binary=True):
         result = struct.pack(">H", result)
     return result
 
+def _hexencode(value):
+    value = binascii.hexlify(value)
+    return value.decode("ascii") if not isinstance(value, str) else value
+
+def _normalize_waf_regex(value):
+    if not PY3 and not isinstance(value, str):
+        value = value.encode("utf8")
+
+    flags = [0]
+    flag_values = {"i": re.I, "m": re.M, "s": re.S, "x": re.X}
+
+    def replace(match):
+        for flag in match.group(1):
+            flags[0] |= flag_values[flag]
+        return ""
+
+    return re.sub(r"\(\?([imsx]+)\)", replace, value), flags[0]
+
+def _compile_waf_regex(value):
+    value, flags = _normalize_waf_regex(value)
+    return re.compile(value, flags)
+
+def _payloads_hash(payloads):
+    value = json.dumps(payloads, ensure_ascii=True, separators=(',', ':'))
+    value = value.encode("ascii") if not isinstance(value, bytes) else value
+    return "sha256:%s" % hashlib.sha256(value).hexdigest()
+
+def validate_data(data):
+    errors = []
+    warnings = []
+    stats = {"payloads": 0, "signatures": 0, "unique_signatures": 0, "wafs": 0}
+
+    if not isinstance(data, dict):
+        return ["data root must be an object"], warnings, stats
+
+    if data.get("schema_version") != 1:
+        errors.append("unsupported or missing schema_version")
+    if data.get("signature_version") != 1:
+        errors.append("unsupported or missing signature_version")
+
+    payloads = data.get("payloads")
+    wafs = data.get("wafs")
+    if not isinstance(payloads, list) or not payloads:
+        errors.append("payloads must be a non-empty list")
+        payloads = []
+    if not isinstance(wafs, dict) or not wafs:
+        errors.append("wafs must be a non-empty object")
+        wafs = {}
+
+    stats["payloads"] = len(payloads)
+    stats["wafs"] = len(wafs)
+
+    actual_payloads_hash = _payloads_hash(payloads)
+    if data.get("payloads_hash") != actual_payloads_hash:
+        errors.append("payloads_hash mismatch (expected '%s')" % actual_payloads_hash)
+
+    expected_markers = []
+    marker_payloads = {}
+    for index, item in enumerate(payloads):
+        if not isinstance(item, type(u"")) or "::" not in item:
+            errors.append("payload %d must use the CATEGORY::VALUE format" % index)
+            continue
+        payload = item.split("::", 1)[1]
+        marker = (calc_hash(payload, binary=False) << 1) & 0xffff
+        expected_markers.append(marker)
+        marker_payloads.setdefault(marker, []).append(index)
+
+    for marker in marker_payloads:
+        if len(marker_payloads[marker]) > 1:
+            errors.append("payload marker collision at indexes %s" % marker_payloads[marker])
+
+    signature_owners = {}
+    for waf in sorted(wafs):
+        item = wafs[waf]
+        if not isinstance(item, dict):
+            errors.append("WAF '%s' must be an object" % waf)
+            continue
+        for key in ("company", "name", "regex", "signatures"):
+            if key not in item:
+                errors.append("WAF '%s' is missing '%s'" % (waf, key))
+
+        regex = item.get("regex")
+        if regex:
+            try:
+                _compile_waf_regex(regex)
+            except Exception as ex:
+                errors.append("WAF '%s' has an invalid regex (%s)" % (waf, ex))
+
+        signatures = item.get("signatures", [])
+        if not isinstance(signatures, list):
+            errors.append("WAF '%s' signatures must be a list" % waf)
+            continue
+
+        seen_signatures = set()
+        for signature in signatures:
+            stats["signatures"] += 1
+            if signature in seen_signatures:
+                errors.append("WAF '%s' contains a duplicate signature" % waf)
+                continue
+            seen_signatures.add(signature)
+            signature_owners.setdefault(signature, set()).add(waf)
+
+            try:
+                checksum, encoded = signature.split(':', 1)
+                decoded = base64.b64decode(encoded)
+                canonical = base64.b64encode(decoded)
+                canonical = canonical.decode("ascii") if not isinstance(canonical, str) else canonical
+                if canonical != encoded:
+                    raise ValueError("non-canonical base64")
+            except (AttributeError, binascii.Error, TypeError, ValueError):
+                errors.append("WAF '%s' contains a malformed signature" % waf)
+                continue
+
+            if checksum.lower() != _hexencode(calc_hash(decoded)):
+                errors.append("WAF '%s' contains a signature with a bad checksum" % waf)
+            if len(decoded) != 2 * len(expected_markers):
+                errors.append("WAF '%s' contains a signature for a different payload count" % waf)
+                continue
+
+            parts = struct.unpack(">%dH" % len(expected_markers), decoded)
+            for index, part in enumerate(parts):
+                if (part & ~1) != expected_markers[index]:
+                    errors.append("WAF '%s' signature has a bad payload marker at index %d" % (waf, index))
+                    break
+
+    stats["unique_signatures"] = len(signature_owners)
+    observed_collisions = dict((signature, sorted(owners)) for signature, owners in signature_owners.items() if len(owners) > 1)
+    declared_collisions = data.get("signature_collisions", {})
+    if not isinstance(declared_collisions, dict):
+        errors.append("signature_collisions must be an object")
+        declared_collisions = {}
+    declared_collisions = dict((signature, sorted(owners)) for signature, owners in declared_collisions.items())
+    if observed_collisions != declared_collisions:
+        errors.append("signature_collisions does not match the observed cross-WAF collisions")
+    for signature in sorted(observed_collisions):
+        warnings.append("shared signature maps to: %s" % ", ".join(observed_collisions[signature]))
+
+    return errors, warnings, stats
+
 def single_print(message):
     if message not in seen:
         print(message)
@@ -211,23 +383,20 @@ def check_payload(payload, protection_regex=GENERIC_PROTECTION_REGEX % '|'.join(
 
     if options.lock and not payload.isdigit():
         if payload == HEURISTIC_PAYLOAD:
-            match = re.search(re.sub(r"Server:|Protected by", "".join(random.sample(string.ascii_letters, 6)), WAF_RECOGNITION_REGEX, flags=re.I), intrusive[RAW] or "")
-            if match:
-                result = True
-
-                for _ in match.groupdict():
-                    if match.group(_):
-                        waf = re.sub(r"\Awaf_", "", _)
-                        locked_regex = DATA_JSON["wafs"][waf]["regex"]
-                        locked_code = intrusive[HTTPCODE]
-                        break
-            else:
-                result = False
+            result = False
+            replacement = "".join(random.sample(string.ascii_letters, 6))
+            for waf in sorted(WAF_PATTERNS):
+                candidate = re.sub(r"Server:|Protected by", replacement, DATA_JSON["wafs"][waf]["regex"], flags=re.I)
+                if _compile_waf_regex(candidate).search(intrusive[RAW] or ""):
+                    result = True
+                    locked_regex = WAF_PATTERNS[waf]
+                    locked_code = intrusive[HTTPCODE]
+                    break
 
             if not result:
                 exit(colorize("[x] can't lock results to a non-blind match"))
         else:
-            result = re.search(locked_regex, intrusive[RAW]) is not None and locked_code == intrusive[HTTPCODE]
+            result = locked_regex.search(intrusive[RAW] or "") is not None and locked_code == intrusive[HTTPCODE]
     elif options.string:
         result = options.string in (intrusive[RAW] or "")
     elif options.code:
@@ -297,6 +466,7 @@ def parse_args():
     parser.add_option("--code", dest="code", type=int, help="Expected HTTP code in rejected responses")
     parser.add_option("--string", dest="string", help="Expected string in rejected responses")
     parser.add_option("--post", dest="post", action="store_true", help="Use POST body for sending payloads")
+    parser.add_option("--validate", dest="validate", action="store_true", help="Validate data.json and exit")
     parser.add_option("--debug", dest="debug", action="store_true", help=optparse.SUPPRESS_HELP)
     parser.add_option("--fast", dest="fast", action="store_true", help=optparse.SUPPRESS_HELP)
     parser.add_option("--lock", dest="lock", action="store_true", help=optparse.SUPPRESS_HELP)
@@ -317,53 +487,91 @@ def parse_args():
         option.help = option.help.capitalize()
 
     try:
-        options, _ = parser.parse_args()
+        options, args = parser.parse_args()
     except SystemExit:
         raise
 
-    if len(sys.argv) > 1:
-        url = sys.argv[-1]
-        if not url.startswith("http"):
-            url = "http://%s" % url
-        options.url = url
+    if options.validate:
+        if args:
+            parser.error("--validate does not accept a target")
+        options.url = None
     else:
-        parser.print_help()
-        raise SystemExit
+        if len(args) != 1:
+            parser.error("exactly one host or URL is required")
+
+        url = args[0]
+        if "://" not in url:
+            url = "http://%s" % url
+        try:
+            parsed = urlsplit(url)
+        except ValueError as ex:
+            parser.error("invalid target URL (%s)" % ex)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            parser.error("target must be an HTTP(S) host or URL")
+        options.url = url
 
     for key in DEFAULTS:
         if getattr(options, key, None) is None:
             setattr(options, key, DEFAULTS[key])
 
+    if options.delay is not None and options.delay < 0:
+        parser.error("--delay must not be negative")
+    if options.timeout <= 0:
+        parser.error("--timeout must be greater than zero")
+    if options.code is not None and not 100 <= options.code <= 599:
+        parser.error("--code must be between 100 and 599")
+
 def load_data():
     global WAF_RECOGNITION_REGEX
 
     if os.path.isfile(DATA_JSON_FILE):
-        with codecs.open(DATA_JSON_FILE, "rb", encoding="utf8") as f:
-            DATA_JSON.update(json.load(f))
+        try:
+            with io.open(DATA_JSON_FILE, "r", encoding="utf8") as f:
+                data = json.load(f)
+        except (IOError, ValueError) as ex:
+            exit(colorize("[x] invalid data file: %s" % ex))
 
-        WAF_RECOGNITION_REGEX = ""
-        for waf in DATA_JSON["wafs"]:
-            if DATA_JSON["wafs"][waf]["regex"]:
-                WAF_RECOGNITION_REGEX += "%s|" % ("(?P<waf_%s>%s)" % (waf, DATA_JSON["wafs"][waf]["regex"]))
+        errors, warnings, stats = validate_data(data)
+        if errors:
+            exit(colorize("[x] invalid data file: %s" % "; ".join(errors)))
+
+        DATA_JSON.clear()
+        DATA_JSON.update(data)
+        DATA_VALIDATION_WARNINGS[:] = warnings
+        DATA_VALIDATION_STATS.clear()
+        DATA_VALIDATION_STATS.update(stats)
+        PAYLOADS[:] = DATA_JSON["payloads"]
+        SIGNATURES.clear()
+        WAF_PATTERNS.clear()
+
+        combined = []
+        combined_flags = 0
+        for waf in sorted(DATA_JSON["wafs"]):
+            regex = DATA_JSON["wafs"][waf]["regex"]
+            if regex:
+                WAF_PATTERNS[waf] = _compile_waf_regex(regex)
+                normalized, flags = _normalize_waf_regex(regex)
+                combined.append("(?:%s)" % normalized)
+                combined_flags |= flags
             for signature in DATA_JSON["wafs"][waf]["signatures"]:
-                SIGNATURES[signature] = waf
-        WAF_RECOGNITION_REGEX = WAF_RECOGNITION_REGEX.strip('|')
+                SIGNATURES.setdefault(signature, [])
+                if waf not in SIGNATURES[signature]:
+                    SIGNATURES[signature].append(waf)
 
-        flags = "".join(set(_ for _ in "".join(re.findall(r"\(\?(\w+)\)", WAF_RECOGNITION_REGEX))))
-        WAF_RECOGNITION_REGEX = "(?%s)%s" % (flags, re.sub(r"\(\?\w+\)", "", WAF_RECOGNITION_REGEX))  # patch for "DeprecationWarning: Flags not at the start of the expression" in Python3.7
+        flag_text = "".join(flag for flag, value in (("i", re.I), ("m", re.M), ("s", re.S), ("x", re.X)) if combined_flags & value)
+        WAF_RECOGNITION_REGEX = "%s%s" % (("(?%s)" % flag_text) if flag_text else "", "|".join(combined))
     else:
         exit(colorize("[x] file '%s' is missing" % DATA_JSON_FILE))
 
 def init():
-    os.chdir(os.path.abspath(os.path.dirname(__file__)))
-
     # Reference: http://blog.mathieu-leplatre.info/python-utf-8-print-fails-when-redirecting-stdout.html
     if not PY3 and not IS_TTY:
         sys.stdout = codecs.getwriter(locale.getpreferredencoding())(sys.stdout)
 
     print(colorize("[o] initializing handlers..."))
 
-    # Reference: https://stackoverflow.com/a/28052583
+    # Intentionally accept invalid/self-signed certificates. Assessment targets
+    # frequently use them, and transport authenticity is not the subject here.
     if hasattr(ssl, "_create_unverified_context"):
         ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -371,20 +579,15 @@ def init():
         if os.path.isfile(options.proxy_file):
             print(colorize("[o] loading proxy list..."))
 
-            with codecs.open(options.proxy_file, "rb", encoding="utf8") as f:
+            with io.open(options.proxy_file, "r", encoding="utf8") as f:
                 proxies.extend(re.sub(r"\s.*", "", _.strip()) for _ in f.read().strip().split('\n') if _.startswith("http"))
                 random.shuffle(proxies)
+            if not proxies:
+                exit(colorize("[x] file '%s' contains no valid HTTP(S) proxies" % options.proxy_file))
         else:
             exit(colorize("[x] file '%s' does not exist" % options.proxy_file))
 
-
-    cookie_jar = CookieJar()
-    opener = build_opener(HTTPCookieProcessor(cookie_jar))
-    install_opener(opener)
-
-    if options.proxy:
-        opener = build_opener(ProxyHandler({"http": options.proxy, "https": options.proxy}))
-        install_opener(opener)
+    _install_http_opener(options.proxy)
 
     if options.random_agent:
         revision = random.randint(20, 64)
@@ -397,21 +600,18 @@ def format_name(waf):
 
 def non_blind_check(raw, silent=False):
     retval = False
-    match = re.search(WAF_RECOGNITION_REGEX, raw or "")
-    if match:
-        retval = True
-        for _ in match.groupdict():
-            if match.group(_):
-                waf = re.sub(r"\Awaf_", "", _)
-                non_blind.add(waf)
-                if not silent:
-                    single_print(colorize("[+] non-blind match: '%s'%s" % (format_name(waf), 20 * ' ')))
+    for waf in sorted(WAF_PATTERNS):
+        if WAF_PATTERNS[waf].search(raw or ""):
+            retval = True
+            non_blind.add(waf)
+            if not silent:
+                single_print(colorize("[+] non-blind match: '%s'%s" % (format_name(waf), 20 * ' ')))
     return retval
 
 def run():
     global original
 
-    hostname = options.url.split("//")[-1].split('/')[0].split(':')[0]
+    hostname = urlsplit(options.url).hostname
 
     if not hostname.replace('.', "").isdigit():
         print(colorize("[i] checking hostname '%s'..." % hostname))
@@ -455,7 +655,8 @@ def run():
     if not check_payload(HEURISTIC_PAYLOAD):
         check = False
         if options.url.startswith("https://"):
-            options.url = options.url.replace("https://", "http://")
+            options.url = "http://%s" % options.url[len("https://"):]
+            print(colorize("[i] retrying the heuristic test over HTTP..."))
             check = check_payload(HEURISTIC_PAYLOAD)
         if not check:
             if non_blind_check(intrusive[RAW]):
@@ -505,7 +706,7 @@ def run():
             blocked.append(info)
 
     _ = calc_hash(signature)
-    signature = "%s:%s" % (_.encode("hex") if not hasattr(_, "hex") else _.hex(), base64.b64encode(signature).decode("ascii"))
+    signature = "%s:%s" % (_hexencode(_), base64.b64encode(signature).decode("ascii"))
 
     print(colorize("%s[=] results: '%s'" % ("\n" if IS_TTY else "", results)))
 
@@ -524,8 +725,8 @@ def run():
         print(colorize("[=] signature: '%s'" % signature))
 
         if signature in SIGNATURES:
-            waf = SIGNATURES[signature]
-            print(colorize("[+] blind match: '%s' (100%%)" % format_name(waf)))
+            wafs = sorted(SIGNATURES[signature], key=format_name)
+            print(colorize("[+] blind match: %s" % ", ".join("'%s' (100%%)" % format_name(waf) for waf in wafs)))
         elif results.count('x') < MIN_MATCH_PARTIAL:
             print(colorize("[-] blind match: -"))
         else:
@@ -546,11 +747,12 @@ def run():
                     elif any(_ in markers for _ in (part & ~1, part | 1)):
                         counter_n += 1
                 result = int(round(100.0 * counter_y / (counter_y + counter_n)))
-                if SIGNATURES[candidate] in matches:
-                    if result > matches[SIGNATURES[candidate]]:
-                        matches[SIGNATURES[candidate]] = result
-                else:
-                    matches[SIGNATURES[candidate]] = result
+                for waf in SIGNATURES[candidate]:
+                    if waf in matches:
+                        if result > matches[waf]:
+                            matches[waf] = result
+                    else:
+                        matches[waf] = result
 
             if chained:
                 for _ in list(matches.keys()):
@@ -569,10 +771,16 @@ def run():
     print()
 
 def main():
-    if "--version" not in sys.argv:
+    if not any(_ in sys.argv for _ in ("--version", "--validate")):
         print(BANNER)
 
     parse_args()
+    if options.validate:
+        print("[+] data file is valid (%d WAFs, %d payloads, %d signatures, %d unique)" % (DATA_VALIDATION_STATS["wafs"], DATA_VALIDATION_STATS["payloads"], DATA_VALIDATION_STATS["signatures"], DATA_VALIDATION_STATS["unique_signatures"]))
+        for warning in DATA_VALIDATION_WARNINGS:
+            print("[!] %s" % warning)
+        return
+
     init()
     run()
 
